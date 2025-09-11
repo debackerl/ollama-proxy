@@ -23,14 +23,7 @@ func NewOpenrouterProvider(baseUrl string, apiKey string) *OpenrouterProvider {
 	}
 }
 
-func (o *OpenrouterProvider) Chat(messages []openai.ChatCompletionMessage, modelName string) (openai.ChatCompletionResponse, error) {
-	// Create a chat completion request
-	req := openai.ChatCompletionRequest{
-		Model:    modelName,
-		Messages: messages,
-		Stream:   false,
-	}
-
+func (o *OpenrouterProvider) Chat(req openai.ChatCompletionRequest) (openai.ChatCompletionResponse, error) {
 	// Call the OpenAI API to get a complete response
 	resp, err := o.client.CreateChatCompletion(context.Background(), req)
 	if err != nil {
@@ -41,14 +34,7 @@ func (o *OpenrouterProvider) Chat(messages []openai.ChatCompletionMessage, model
 	return resp, nil
 }
 
-func (o *OpenrouterProvider) ChatStream(messages []openai.ChatCompletionMessage, modelName string) (*openai.ChatCompletionStream, error) {
-	// Create a chat completion request
-	req := openai.ChatCompletionRequest{
-		Model:    modelName,
-		Messages: messages,
-		Stream:   true,
-	}
-
+func (o *OpenrouterProvider) ChatStream(req openai.ChatCompletionRequest) (*openai.ChatCompletionStream, error) {
 	// Call the OpenAI API to get a streaming response
 	stream, err := o.client.CreateChatCompletionStream(context.Background(), req)
 	if err != nil {

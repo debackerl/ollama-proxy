@@ -1,5 +1,4 @@
-# Enchanted Proxy for OpenRouter
-This repository is specifically made for use with the [Enchanted project](https://github.com/gluonfield/enchanted/tree/main), but can also be used for several other purposes that require an Ollama Endpoint.
+# Proxy for OpenRouter
 The original author of this proxy is [marknefedov](https://github.com/marknefedov/ollama-openrouter-proxy).
 
 ## Description

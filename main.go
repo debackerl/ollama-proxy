@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,9 +13,54 @@ import (
 	"strings"
 	"time"
 
+	"gopkg.in/yaml.v3"
 	"github.com/gin-gonic/gin"
 	openai "github.com/sashabaranov/go-openai"
 )
+
+type OllamaMessage struct {
+	Role string `json:"role"`
+	Content string `json:"content"`
+	ToolCalls []OllamaToolCall `json:"tool_calls,omitempty"`
+}
+
+func (c *OllamaMessage) ToOpenAi() openai.ChatCompletionMessage {
+	var toolCalls []openai.ToolCall
+	for _, toolCall := range c.ToolCalls {
+		toolCalls = append(toolCalls, toolCall.ToOpenAi())
+	}
+
+	return openai.ChatCompletionMessage{
+		Role: c.Role,
+		Content: c.Content,
+		ToolCalls: toolCalls,
+	}
+}
+
+type OllamaToolCall struct {
+	Function OllamaFunctionCall `json:"function"`
+}
+
+func (c *OllamaToolCall) ToOpenAi() openai.ToolCall {
+	return openai.ToolCall{
+		Type: "function",
+		Function: c.Function.ToOpenAi(),
+	}
+}
+
+type OllamaFunctionCall struct {
+	Name string `json:"name"`
+	Arguments map[string]interface{} `json:"arguments"`
+}
+
+func (c *OllamaFunctionCall) ToOpenAi() openai.FunctionCall {
+	b, _ := json.Marshal(c.Arguments)
+
+	return openai.FunctionCall{
+		Name: c.Name,
+		Arguments: string(b),
+	}
+}
 
 var modelFilter map[string]struct{}
 
@@ -40,6 +86,38 @@ func loadModelFilter(path string) (map[string]struct{}, error) {
 	}
 
 	return filter, nil
+}
+
+func parseChoices(choices []openai.ChatCompletionChoice) (string, []map[string]interface{}) {
+	content := ""
+	var parsedToolCalls []map[string]interface{}
+
+	if len(choices) > 0 {
+		msg := choices[0].Message
+
+		toolCalls := msg.ToolCalls
+		if toolCalls != nil && len(toolCalls) > 0 {
+			for _, tc := range toolCalls {
+				// Parse arguments using YAML to be more foregiving with improper JSON
+				var argsMap map[string]interface{}
+				if err := yaml.Unmarshal([]byte(tc.Function.Arguments), &argsMap); err == nil {
+					parsedToolCall := map[string]interface{}{
+						"function": map[string]interface{}{
+							"name": tc.Function.Name,
+							"arguments": argsMap,
+						},
+					}
+					parsedToolCalls = append(parsedToolCalls, parsedToolCall)
+					} else {
+					slog.Error("Failed to parse arguments for tool call", "Error", err)
+				}
+			}
+		}
+
+		content = msg.Content
+	}
+
+	return content, parsedToolCalls
 }
 
 func main() {
@@ -102,7 +180,7 @@ func main() {
 		// Construct a new array of model objects with extra fields
 		newModels := make([]map[string]interface{}, 0, len(models))
 		for _, m := range models {
-			// Если фильтр пустой, значит пропускаем проверку и берём все модели
+			// If the filter is empty, skip the check and include all models
 			if len(filter) > 0 {
 				if _, ok := filter[m.Model]; !ok {
 					continue
@@ -145,40 +223,62 @@ func main() {
 
 	r.POST("/api/chat", func(c *gin.Context) {
 		var request struct {
-			Model    string                         `json:"model"`
-			Messages []openai.ChatCompletionMessage `json:"messages"`
-			Stream   *bool                          `json:"stream"` // Добавим поле Stream
+			Model     string          `json:"model"`
+			Messages  []OllamaMessage `json:"messages"`
+			Tools     []openai.Tool   `json:"tools"`
+			Stream    *bool           `json:"stream"`
+			Think     *bool           `json:"think"`
+			KeepAlive string          `json:"keep_alive"` // ex: 30.0s
+			Options   map[string]interface{} `json:"options"` // ex: {"num_ctx": 4096.0}
 		}
 
 		// Parse the JSON request
-		if err := c.ShouldBindJSON(&request); err != nil {
+		bodyBytes, _ := c.GetRawData()
+		if err := json.Unmarshal(bodyBytes, &request); err != nil {
+		//if err := c.ShouldBindJSON(&request); err != nil {
+			// Read the raw request body as a string for logging
+			slog.Error("Invalid JSON payload", "Error", err, "RequestBody", string(bodyBytes))
+
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON payload"})
 			return
 		}
 
-		// Определяем, нужен ли стриминг (по умолчанию true, если не указано для /api/chat)
-		// ВАЖНО: Open WebUI может НЕ передавать "stream": true для /api/chat, подразумевая это.
-		// Нужно проверить, какой запрос шлет Open WebUI. Если не шлет, ставим true.
+		var openAiMessages []openai.ChatCompletionMessage
+		for _, message := range request.Messages {
+			openAiMessages = append(openAiMessages, message.ToOpenAi())
+		}
+
+		//slog.Info("Requested model", "model", request.Model)
+		fullModelName, err := provider.GetFullModelName(request.Model)
+		if err != nil {
+			slog.Error("Error getting full model name", "Error", err, "model", request.Model)
+			// Ollama returns 404 for an incorrect model name
+			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+			return
+		}
+
+		// Determine if streaming is needed (defaults to true if not specified for /api/chat)
+		// IMPORTANT: Open WebUI may NOT send "stream": true for /api/chat, implying it.
+		// Need to check what request the Open WebUI sends. If it doesn't send it, default to true.
 		streamRequested := true
 		if request.Stream != nil {
 			streamRequested = *request.Stream
 		}
 
-		// Если стриминг не запрошен, нужно будет реализовать отдельную логику
-		// для сбора полного ответа и отправки его одним JSON.
-		// Пока реализуем только стриминг.
+		// If streaming is not requested, separate logic is required to gather the full response and send it as one JSON.
+		// For now, only streaming is implemented.
 		if !streamRequested {
 			// Handle non-streaming response
-			fullModelName, err := provider.GetFullModelName(request.Model)
-			if err != nil {
-				slog.Error("Error getting full model name", "Error", err)
-				// Ollama returns 404 for invalid model names
-				c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
-				return
+
+			req := openai.ChatCompletionRequest{
+				Model:    request.Model,
+				Messages: openAiMessages,
+				Tools:    request.Tools,
+				Stream:   false,
 			}
 
 			// Call Chat to get the complete response
-			response, err := provider.Chat(request.Messages, fullModelName)
+			response, err := provider.Chat(req)
 			if err != nil {
 				slog.Error("Failed to get chat response", "Error", err)
 				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -191,11 +291,8 @@ func main() {
 				return
 			}
 
-			// Extract the content from the response
-			content := ""
-			if len(response.Choices) > 0 && response.Choices[0].Message.Content != "" {
-				content = response.Choices[0].Message.Content
-			}
+			// Extract the content and tool calls from the response
+			content, parsedToolCalls := parseChoices(response.Choices)
 
 			// Get finish reason, default to "stop" if not provided
 			finishReason := "stop"
@@ -207,148 +304,231 @@ func main() {
 			ollamaResponse := map[string]interface{}{
 				"model":      fullModelName,
 				"created_at": time.Now().Format(time.RFC3339),
-				"message": map[string]string{
-					"role":    "assistant",
-					"content": content,
+				"message":    map[string]interface{}{
+					"role":       "assistant",
+					"content":    content,
+					"tool_calls": parsedToolCalls,
 				},
 				"done":              true,
 				"finish_reason":     finishReason,
-				"total_duration":    response.Usage.TotalTokens * 10, // Approximate duration based on token count
+				"total_duration":    0,
 				"load_duration":     0,
-				"prompt_eval_count": response.Usage.PromptTokens,
-				"eval_count":        response.Usage.CompletionTokens,
-				"eval_duration":     response.Usage.CompletionTokens * 10, // Approximate duration based on token count
+				"prompt_eval_count": 0,
+				"eval_count":        0,
+				"eval_duration":     0,
 			}
 
 			c.JSON(http.StatusOK, ollamaResponse)
-			return
-		}
-
-		slog.Info("Requested model", "model", request.Model)
-		fullModelName, err := provider.GetFullModelName(request.Model)
-		if err != nil {
-			slog.Error("Error getting full model name", "Error", err, "model", request.Model)
-			// Ollama возвращает 404 на неправильное имя модели
-			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
-			return
-		}
-		slog.Info("Using model", "fullModelName", fullModelName)
-
-		// Call ChatStream to get the stream
-		stream, err := provider.ChatStream(request.Messages, fullModelName)
-		if err != nil {
-			slog.Error("Failed to create stream", "Error", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
-		defer stream.Close() // Ensure stream closure
-
-		// --- ИСПРАВЛЕНИЯ для NDJSON (Ollama-style) ---
-
-		// Set headers CORRECTLY for Newline Delimited JSON
-		c.Writer.Header().Set("Content-Type", "application/x-ndjson") // <--- КЛЮЧЕВОЕ ИЗМЕНЕНИЕ
-		c.Writer.Header().Set("Cache-Control", "no-cache")
-		c.Writer.Header().Set("Connection", "keep-alive")
-		// Transfer-Encoding: chunked устанавливается Gin автоматически
-
-		w := c.Writer // Получаем ResponseWriter
-		flusher, ok := w.(http.Flusher)
-		if !ok {
-			slog.Error("Expected http.ResponseWriter to be an http.Flusher")
-			// Отправить ошибку клиенту уже сложно, т.к. заголовки могли уйти
-			return
-		}
-
-		var lastFinishReason string
-
-		// Stream responses back to the client
-		for {
-			response, err := stream.Recv()
-			if errors.Is(err, io.EOF) {
-				// End of stream from the backend provider
-				break
+		} else {
+			req := openai.ChatCompletionRequest{
+				Model:    request.Model,
+				Messages: openAiMessages,
+				Tools:    request.Tools,
+				Stream:   true,
 			}
+
+			//slog.Info("Request", "Request", req)
+
+			// Call ChatStream to get the stream
+			stream, err := provider.ChatStream(req)
 			if err != nil {
-				slog.Error("Backend stream error", "Error", err)
-				// Попытка отправить ошибку в формате NDJSON
-				// Ollama обычно просто обрывает соединение или шлет 500 перед этим
-				errorMsg := map[string]string{"error": "Stream error: " + err.Error()}
-				errorJson, _ := json.Marshal(errorMsg)
-				fmt.Fprintf(w, "%s\n", string(errorJson)) // Отправляем ошибку + \n
-				flusher.Flush()
+				slog.Error("Failed to create stream", "Error", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+			defer stream.Close() // Ensure stream closure
+
+			// Set headers correctly for Newline Delimited JSON
+			c.Writer.Header().Set("Content-Type", "application/x-ndjson")
+			c.Writer.Header().Set("Cache-Control", "no-cache")
+			c.Writer.Header().Set("Connection", "keep-alive")
+			// Transfer-Encoding: chunked is set automatically by Gin
+
+			w := c.Writer // Get the ResponseWriter
+			flusher, ok := w.(http.Flusher)
+			if !ok {
+				slog.Error("Expected http.ResponseWriter to be an http.Flusher")
+				// Sending an error to the client is difficult as headers may have already been sent
 				return
 			}
 
-			// Сохраняем причину остановки, если она есть в чанке
-			if len(response.Choices) > 0 && response.Choices[0].FinishReason != "" {
-				lastFinishReason = string(response.Choices[0].FinishReason)
+			var lastFinishReason string
+			var toolName string
+			var argsBuffer bytes.Buffer // arguments for tool calls are streamed
+
+			flushToolCall := func() {
+				if toolName == "" {
+					return
+				}
+
+				var parsedToolCalls []map[string]interface{}
+
+				// Parse arguments using YAML to be more foregiving with improper JSON
+				var argsMap map[string]interface{}
+				if err := yaml.Unmarshal(argsBuffer.Bytes(), &argsMap); err == nil {
+					parsedToolCall := map[string]interface{}{
+						"function": map[string]interface{}{
+							"name": toolName,
+							"arguments": argsMap,
+						},
+					}
+					parsedToolCalls = append(parsedToolCalls, parsedToolCall)
+					} else {
+					slog.Error("Failed to parse arguments for tool call", "Error", err)
+				}
+
+				toolName = ""
+				argsBuffer.Reset()
+
+				if len(parsedToolCalls) > 0 {
+					// Build JSON response structure for intermediate chunks (Ollama chat format)
+					responseJSON := map[string]interface{}{
+						"model":      fullModelName,
+						"created_at": time.Now().Format(time.RFC3339),
+						"message":    map[string]interface{}{
+							"role":       "assistant",
+							"tool_calls": parsedToolCalls,
+						},
+						"done":       false, // Always false for intermediate chunks
+					}
+
+					// Marshal JSON
+					jsonData, err := json.Marshal(responseJSON)
+					if err != nil {
+						slog.Error("Error marshaling intermediate response JSON", "Error", err)
+						return // Return, as we cannot send data
+					}
+					//slog.Info("Response Chunk", "Data:", jsonData)
+
+					// Send JSON object followed by a newline
+					fmt.Fprintf(w, "%s\n", string(jsonData))
+				}
 			}
 
-			// Build JSON response structure for intermediate chunks (Ollama chat format)
-			responseJSON := map[string]interface{}{
+			// Stream responses back to the client
+			for {
+				response, err := stream.Recv()
+				if errors.Is(err, io.EOF) {
+					// End of stream from the backend provider
+					break
+				}
+				if err != nil {
+					slog.Error("Backend stream error", "Error", err)
+					// Attempt to send an error in NDJSON format
+					// Ollama usually just drops the connection or sends a 500 error before that
+					errorMsg := map[string]string{"error": "Stream error: " + err.Error()}
+					errorJson, _ := json.Marshal(errorMsg)
+					fmt.Fprintf(w, "%s\n", string(errorJson)) // Send the error + \n
+					flusher.Flush()
+					return
+				}
+
+				if len(response.Choices) == 0 {
+					continue
+				}
+
+				// Extract the content and tool calls from the response
+				content := ""
+			
+				if len(response.Choices) > 0 {
+					delta := response.Choices[0].Delta
+
+					toolCalls := delta.ToolCalls
+					if toolCalls != nil && len(toolCalls) > 0 {
+						for _, tc := range toolCalls {
+							//slog.Info("Tool Call", "Name", tc.Function.Name, "Arguments", tc.Function.Arguments)
+
+							if tc.Function.Name != "" {
+								flushToolCall()
+
+								// only given in the first chunk
+								toolName = tc.Function.Name
+							}
+
+							argsBuffer.WriteString(tc.Function.Arguments)
+						}
+					}
+
+					content = response.Choices[0].Delta.Content
+					if content != "" {
+						flushToolCall()
+					}
+				}
+
+				// Save the stop reason if present in the chunk
+				if response.Choices[0].FinishReason != "" {
+					lastFinishReason = string(response.Choices[0].FinishReason)
+				}
+
+				if content != "" {
+					// Build JSON response structure for intermediate chunks (Ollama chat format)
+					responseJSON := map[string]interface{}{
+						"model":      fullModelName,
+						"created_at": time.Now().Format(time.RFC3339),
+						"message":    map[string]interface{}{
+							"role":       "assistant",
+							"content":    content,
+						},
+						"done":       false, // Always false for intermediate chunks
+					}
+
+					// Marshal JSON
+					jsonData, err := json.Marshal(responseJSON)
+					if err != nil {
+						slog.Error("Error marshaling intermediate response JSON", "Error", err)
+						return // Return, as we cannot send data
+					}
+					//slog.Info("Response Chunk", "Data:", jsonData)
+
+					// Send JSON object followed by a newline
+					fmt.Fprintf(w, "%s\n", string(jsonData))
+				}
+
+				// Flush data to send it immediately
+				flusher.Flush()
+			}
+
+			// --- Sending final message (done: true) in Ollama style ---
+
+			// Determine the stop reason (if the backend did not provide one, use 'stop')
+			// Ollama uses 'stop', 'length', 'content_filter', 'tool_calls'
+			if lastFinishReason == "" {
+				lastFinishReason = "stop"
+			}
+
+			flushToolCall()
+
+			// IMPORTANT: Replace nil with 0 for numeric stats fields
+			finalResponse := map[string]interface{}{
 				"model":      fullModelName,
 				"created_at": time.Now().Format(time.RFC3339),
-				"message": map[string]string{
+				"message": map[string]string{ // required by ollama-python
 					"role":    "assistant",
-					"content": response.Choices[0].Delta.Content, // Может быть ""
+					"content": "",
 				},
-				"done": false, // Всегда false для промежуточных чанков
+				"done":              true,
+				"finish_reason":     lastFinishReason, // Not required for /api/chat Ollama, but does no harm
+				"total_duration":    0,
+				"load_duration":     0,
+				"prompt_eval_count": 0,
+				"eval_count":        0,
+				"eval_duration":     0,
 			}
 
-			// Marshal JSON
-			jsonData, err := json.Marshal(responseJSON)
+			finalJsonData, err := json.Marshal(finalResponse)
 			if err != nil {
-				slog.Error("Error marshaling intermediate response JSON", "Error", err)
-				return // Прерываем, так как не можем отправить данные
+				slog.Error("Error marshaling final response JSON", "Error", err)
+				return
 			}
 
-			// Send JSON object followed by a newline
-			fmt.Fprintf(w, "%s\n", string(jsonData)) // <--- ИЗМЕНЕНО: Формат NDJSON (JSON + \n)
-
-			// Flush data to send it immediately
+			// Send the final JSON object + newline
+			fmt.Fprintf(w, "%s\n", string(finalJsonData))
 			flusher.Flush()
+
+			// IMPORTANT: For NDJSON there is NO 'data: [DONE]' marker.
+			// The client detects the end of the stream by receiving an object with "done": true
+			// and/or by the server closing the connection (Gin will close it automatically after exiting the handler).
 		}
-
-		// --- Отправка финального сообщения (done: true) в стиле Ollama ---
-
-		// Определяем причину остановки (если бэкенд не дал, ставим 'stop')
-		// Ollama использует 'stop', 'length', 'content_filter', 'tool_calls'
-		if lastFinishReason == "" {
-			lastFinishReason = "stop"
-		}
-
-		// ВАЖНО: Замените nil на 0 для числовых полей статистики
-		finalResponse := map[string]interface{}{
-			"model":      fullModelName,
-			"created_at": time.Now().Format(time.RFC3339),
-			"message": map[string]string{
-				"role":    "assistant",
-				"content": "", // Пустой контент для финального сообщения
-			},
-			"done":              true,
-			"finish_reason":     lastFinishReason, // Необязательно для /api/chat Ollama, но не вредит
-			"total_duration":    0,
-			"load_duration":     0,
-			"prompt_eval_count": 0, // <--- ИЗМЕНЕНО: nil заменен на 0
-			"eval_count":        0, // <--- ИЗМЕНЕНО: nil заменен на 0
-			"eval_duration":     0,
-		}
-
-		finalJsonData, err := json.Marshal(finalResponse)
-		if err != nil {
-			slog.Error("Error marshaling final response JSON", "Error", err)
-			return
-		}
-
-		// Отправляем финальный JSON-объект + newline
-		fmt.Fprintf(w, "%s\n", string(finalJsonData)) // <--- ИЗМЕНЕНО: Формат NDJSON
-		flusher.Flush()
-
-		// ВАЖНО: Для NDJSON НЕТ 'data: [DONE]' маркера.
-		// Клиент понимает конец потока по получению объекта с "done": true
-		// и/или по закрытию соединения сервером (что Gin сделает автоматически после выхода из хендлера).
-
-		// --- Конец исправлений ---
 	})
 
 	r.Run(":11434")
