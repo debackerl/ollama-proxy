@@ -21,6 +21,7 @@ import (
 type OllamaMessage struct {
 	Role string `json:"role"`
 	Content string `json:"content"`
+	Thinking string `json:"thinking,omitempty"`
 	ToolCalls []OllamaToolCall `json:"tool_calls,omitempty"`
 }
 
@@ -34,6 +35,8 @@ func (c *OllamaMessage) ToOpenAi() openai.ChatCompletionMessage {
 		Role: c.Role,
 		Content: c.Content,
 		ToolCalls: toolCalls,
+		ToolCallID: "", // TODO: should be set when role=tool, must match the "id" returned as part of a Tool Call from the LLM
+		ReasoningContent: c.Thinking,
 	}
 }
 
@@ -50,15 +53,13 @@ func (c *OllamaToolCall) ToOpenAi() openai.ToolCall {
 
 type OllamaFunctionCall struct {
 	Name string `json:"name"`
-	Arguments map[string]interface{} `json:"arguments"`
+	Arguments json.RawMessage `json:"arguments"`
 }
 
 func (c *OllamaFunctionCall) ToOpenAi() openai.FunctionCall {
-	b, _ := json.Marshal(c.Arguments)
-
 	return openai.FunctionCall{
 		Name: c.Name,
-		Arguments: string(b),
+		Arguments: string(c.Arguments),
 	}
 }
 
@@ -88,8 +89,9 @@ func loadModelFilter(path string) (map[string]struct{}, error) {
 	return filter, nil
 }
 
-func parseChoices(choices []openai.ChatCompletionChoice) (string, []map[string]interface{}) {
+func parseChoices(choices []openai.ChatCompletionChoice) (string, string, []map[string]interface{}) {
 	content := ""
+	thinking := ""
 	var parsedToolCalls []map[string]interface{}
 
 	if len(choices) > 0 {
@@ -115,9 +117,10 @@ func parseChoices(choices []openai.ChatCompletionChoice) (string, []map[string]i
 		}
 
 		content = msg.Content
+		thinking = msg.ReasoningContent
 	}
 
-	return content, parsedToolCalls
+	return content, thinking, parsedToolCalls
 }
 
 func main() {
@@ -234,6 +237,9 @@ func main() {
 
 		// Parse the JSON request
 		bodyBytes, _ := c.GetRawData()
+
+		//slog.Info("Request", "Request", string(bodyBytes))
+
 		if err := json.Unmarshal(bodyBytes, &request); err != nil {
 		//if err := c.ShouldBindJSON(&request); err != nil {
 			// Read the raw request body as a string for logging
@@ -292,7 +298,7 @@ func main() {
 			}
 
 			// Extract the content and tool calls from the response
-			content, parsedToolCalls := parseChoices(response.Choices)
+			content, thinking, parsedToolCalls := parseChoices(response.Choices)
 
 			// Get finish reason, default to "stop" if not provided
 			finishReason := "stop"
@@ -307,6 +313,7 @@ func main() {
 				"message":    map[string]interface{}{
 					"role":       "assistant",
 					"content":    content,
+					"thinking":   thinking,
 					"tool_calls": parsedToolCalls,
 				},
 				"done":              true,
@@ -323,11 +330,12 @@ func main() {
 			req := openai.ChatCompletionRequest{
 				Model:    request.Model,
 				Messages: openAiMessages,
-				Tools:    request.Tools,
+				Tools:    request.Tools, // the doc (https://ollama.readthedocs.io/en/api/) says that streaming is not supported with tools, but HASS does it anyway
 				Stream:   true,
 			}
 
-			//slog.Info("Request", "Request", req)
+			//reqJson, _ := json.Marshal(req)
+			//slog.Info("Request", "Request", string(reqJson))
 
 			// Call ChatStream to get the stream
 			stream, err := provider.ChatStream(req)
@@ -427,9 +435,12 @@ func main() {
 					continue
 				}
 
+				//slog.Info("Response", "Choices", response.Choices)
+
 				// Extract the content and tool calls from the response
 				content := ""
-			
+				thinking := ""
+
 				if len(response.Choices) > 0 {
 					delta := response.Choices[0].Delta
 
@@ -449,8 +460,9 @@ func main() {
 						}
 					}
 
-					content = response.Choices[0].Delta.Content
-					if content != "" {
+					content = delta.Content
+					thinking = delta.ReasoningContent
+					if content != "" || thinking != "" {
 						flushToolCall()
 					}
 				}
@@ -460,7 +472,7 @@ func main() {
 					lastFinishReason = string(response.Choices[0].FinishReason)
 				}
 
-				if content != "" {
+				if content != "" || thinking != "" {
 					// Build JSON response structure for intermediate chunks (Ollama chat format)
 					responseJSON := map[string]interface{}{
 						"model":      fullModelName,
@@ -468,6 +480,7 @@ func main() {
 						"message":    map[string]interface{}{
 							"role":       "assistant",
 							"content":    content,
+							"thinking":   thinking,
 						},
 						"done":       false, // Always false for intermediate chunks
 					}
