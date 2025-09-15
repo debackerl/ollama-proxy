@@ -173,7 +173,7 @@ func main() {
 	})
 
 	r.GET("/api/tags", func(c *gin.Context) {
-		models, err := provider.GetModels()
+		models, err := provider.GetModels(c)
 		if err != nil {
 			slog.Error("Error getting models", "Error", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -255,7 +255,7 @@ func main() {
 		}
 
 		//slog.Info("Requested model", "model", request.Model)
-		fullModelName, err := provider.GetFullModelName(request.Model)
+		fullModelName, err := provider.GetFullModelName(c, request.Model)
 		if err != nil {
 			slog.Error("Error getting full model name", "Error", err, "model", request.Model)
 			// Ollama returns 404 for an incorrect model name
@@ -284,7 +284,7 @@ func main() {
 			}
 
 			// Call Chat to get the complete response
-			response, err := provider.Chat(req)
+			response, err := provider.Chat(c, req)
 			if err != nil {
 				slog.Error("Failed to get chat response", "Error", err)
 				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -338,7 +338,7 @@ func main() {
 			//slog.Info("Request", "Request", string(reqJson))
 
 			// Call ChatStream to get the stream
-			stream, err := provider.ChatStream(req)
+			stream, err := provider.ChatStream(c, req)
 			if err != nil {
 				slog.Error("Failed to create stream", "Error", err)
 				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
